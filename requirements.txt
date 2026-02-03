@@ -1,0 +1,25 @@
+# LLM & Agent (2025–2026 stack)
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-community>=0.3.0
+langgraph>=0.2.0
+langchain-groq>=0.2.0
+langchain-openai>=0.2.0
+
+# Embeddings & Vector DB
+langchain-huggingface>=0.1.0
+chromadb>=0.5.0
+sentence-transformers>=3.0.0
+
+# Data & APIs
+yfinance>=0.2.40
+pandas>=2.0.0
+numpy>=1.24.0
+requests>=2.31.0
+
+# UI & App
+streamlit>=1.38.0
+python-dotenv>=1.0.0
+
+# Optional: local open LLM (uncomment if using Ollama)
+# langchain-ollama>=0.2.0
