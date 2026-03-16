@@ -10,3 +10,4 @@ data/*.db
 *.egg-info/
 dist/
 build/
+.DS_Store

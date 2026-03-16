@@ -1,16 +1,23 @@
 # -*- coding: utf-8 -*-
 """Portfolio scenario simulation (Monte Carlo–style projection)."""
+import asyncio
 import numpy as np
 import yfinance as yf
 from langchain_core.tools import tool
 from config import SCENARIO_DEFAULT_YEARS, SCENARIO_DEFAULT_SIMULATIONS
+from .cache import historical_cache
 
 
 def _fetch_historical_returns(ticker: str, years: int = 5) -> np.ndarray | None:
-    """Get daily log returns for a ticker. Returns None if insufficient data."""
+    """Get daily log returns for a ticker with 60s caching. Returns None if insufficient data."""
     try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period=f"{max(years, 2)}y")
+        period = f"{max(years, 2)}y"
+        cache_key = f"{ticker.upper()}::{period}"
+        hist = historical_cache.get(cache_key)
+        if hist is None:
+            stock = yf.Ticker(ticker)
+            hist = stock.history(period=period)
+            historical_cache.set(cache_key, hist)
         if hist.empty or len(hist) < 22:
             return None
         close = hist["Close"].astype(float)
@@ -18,6 +25,16 @@ def _fetch_historical_returns(ticker: str, years: int = 5) -> np.ndarray | None:
         return log_returns.values
     except Exception:
         return None
+
+
+async def _fetch_all_returns_concurrent(tickers: list[str], years: int) -> list[np.ndarray | None]:
+    loop = asyncio.get_running_loop()
+
+    async def _one(t: str):
+        return await loop.run_in_executor(None, _fetch_historical_returns, t, years + 1)
+
+    tasks = [_one(t) for t in tickers]
+    return await asyncio.gather(*tasks)
 
 
 @tool
@@ -57,13 +74,15 @@ def run_portfolio_simulation(
         return f"Weights must sum to 1.0, got {total_w:.2f}."
     weights = np.array(weights)
 
-    # Get historical returns per ticker
-    returns_list = []
-    for t in tickers:
-        r = _fetch_historical_returns(t, years=years + 1)
+    # Get historical returns per ticker concurrently to speed up multi-ticker sims
+    try:
+        returns_list = asyncio.run(_fetch_all_returns_concurrent(tickers, years=years))
+    except RuntimeError:
+        # If there's already a running loop (e.g. inside another async context), fall back to sequential
+        returns_list = [_fetch_historical_returns(t, years=years + 1) for t in tickers]
+    for t, r in zip(tickers, returns_list):
         if r is None or len(r) < 22:
             return f"Insufficient history for {t}. Use major tickers (e.g. AAPL, MSFT)."
-        returns_list.append(r)
     # Align length to minimum
     min_len = min(len(r) for r in returns_list)
     returns_matrix = np.column_stack([r[-min_len:] for r in returns_list])

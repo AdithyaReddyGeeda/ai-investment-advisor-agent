@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
-"""LangGraph ReAct agent for the investment advisor."""
-from typing import Optional
+"""LangGraph multi-agent setup for the investment advisor."""
+import re
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.tools import tool
-from langchain_core.messages import SystemMessage
 from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 
@@ -18,7 +21,14 @@ from tools import (
     run_portfolio_simulation,
     get_stock_news_sentiment,
 )
-from guardrails import check_response_guardrails, get_disclaimer_fragment
+from guardrails import get_disclaimer_fragment
+from eval.metrics import log_eval_result
+from observability.logging_utils import (
+    log_guardrail_event,
+    log_response_metrics,
+)
+from observability.tool_wrappers import wrap_tools_with_logging
+
 
 AGENT_SYSTEM_PROMPT = """You are a helpful, honest AI investment advisor. Use tools when needed.
 
@@ -43,60 +53,236 @@ def make_retrieve_portfolio_tool(vectorstore):
     return retrieve_portfolio
 
 
-def create_advisor_agent(vectorstore=None):
-    """
-    Create the LangGraph ReAct agent with all tools. If vectorstore is provided,
-    adds retrieve_portfolio for RAG over portfolio/docs.
+def _extract_final_text_and_trajectory(messages: List[BaseMessage]) -> Tuple[str, List[Dict[str, Any]], List[str]]:
+    """Pull final assistant text, trajectory, and list of tool names from LangGraph output."""
+    response_text = ""
+    trajectory: List[Dict[str, Any]] = []
+    tools_used: List[str] = []
+    for m in messages:
+        if hasattr(m, "tool_calls") and m.tool_calls:
+            for tc in m.tool_calls:
+                name = tc.get("name")
+                trajectory.append({"tool": name, "args": tc.get("args", {})})
+                if name:
+                    tools_used.append(name)
+        if getattr(m, "__class__", {}).__name__ == "AIMessage" and getattr(m, "content", None):
+            raw = m.content
+            if isinstance(raw, str):
+                response_text = raw
+            elif isinstance(raw, list):
+                parts = []
+                for block in raw:
+                    if isinstance(block, str):
+                        parts.append(block)
+                    elif isinstance(block, dict) and "text" in block:
+                        parts.append(block["text"])
+                    else:
+                        parts.append(str(block))
+                response_text = "".join(parts) if parts else ""
+            else:
+                response_text = str(raw)
+    return response_text, trajectory, tools_used
+
+
+def _normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    text = " ".join(text.split())
+    text = re.sub(r"\.([a-zA-Z])", r". \1", text)
+    text = re.sub(r"(\d|[.,])([a-zA-Z])", r"\1 \2", text)
+    text = re.sub(r"([a-zA-Z])(\d)", r"\1 \2", text)
+    text = re.sub(r"purchasepricepershareis", "purchase price per share is", text, flags=re.IGNORECASE)
+    text = re.sub(r"pricepershare", "price per share", text, flags=re.IGNORECASE)
+    text = re.sub(r"thepurchase", "the purchase", text, flags=re.IGNORECASE)
+    text = re.sub(r"priceof", "price of", text, flags=re.IGNORECASE)
+    text = re.sub(r"purchaseprice", "purchase price", text, flags=re.IGNORECASE)
+    text = re.sub(r"pershare", "per share", text, flags=re.IGNORECASE)
+    text = re.sub(r"shareis", "share is", text, flags=re.IGNORECASE)
+    text = re.sub(r"andpurchase", "and a purchase", text, flags=re.IGNORECASE)
+    return " ".join(text.split())
+
+
+def _llm_guardrail_judge(question: str, answer: str) -> Tuple[bool, bool]:
+    """Use a small fast model to judge whether the answer is safe and needs a disclaimer.
+
+    Returns (allowed, needs_disclaimer).
     """
     if not GROQ_API_KEY:
+        # If we cannot call the judge model, fall back to allowing with disclaimer hint based on length.
+        needs = len(answer or "") > 200
+        return True, needs
+
+    judge_model = ChatGroq(
+        model="llama-3.1-8b-instant",
+        api_key=GROQ_API_KEY,
+        temperature=0.0,
+    )
+    prompt = (
+        "You are a compliance assistant for an investment chatbot.\n"
+        "Given the user's question and the assistant's draft answer, decide if the answer:\n"
+        "1) contains specific financial advice (e.g., 'you should buy X', 'sell Y now', detailed portfolio allocation instructions for the user),\n"
+        "2) contains tax advice, or\n"
+        "3) guarantees or implies guaranteed returns.\n\n"
+        "Respond ONLY in JSON with keys: `allowed` (true/false), `needs_disclaimer` (true/false).\n\n"
+        f"Question: {question}\n"
+        f"Answer: {answer}\n"
+    )
+    try:
+        resp = judge_model.invoke([HumanMessage(content=prompt)])
+        content = resp.content if isinstance(resp.content, str) else str(resp.content)
+        allowed = True
+        needs_disclaimer = False
+        if "false" in content.lower():
+            # crude parse: if explicitly says false for allowed, block
+            if '"allowed": false' in content.replace(" ", "").lower():
+                allowed = False
+        if '"needs_disclaimer": true' in content.replace(" ", "").lower():
+            needs_disclaimer = True
+        return allowed, needs_disclaimer
+    except Exception:
+        return True, len(answer or "") > 200
+
+
+def create_research_agent(vectorstore=None):
+    """Agent focused on data fetching, RAG, and external context."""
+    if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY is not set. Add it to your .env file.")
-    model = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY, temperature=0.2)
+    model = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY, temperature=0.1)
     tools = [
         get_stock_price,
         get_stock_info,
         get_historical_prices,
         calculate_holding_value,
-        calculate_sharpe_ratio,
-        calculate_portfolio_metrics,
-        compound_annual_growth_rate,
-        run_portfolio_simulation,
         get_stock_news_sentiment,
     ]
     if vectorstore is not None:
         tools.append(make_retrieve_portfolio_tool(vectorstore))
-    agent = create_react_agent(
-        model,
-        tools,
-        state_modifier=SystemMessage(content=AGENT_SYSTEM_PROMPT),
-    )
-    return agent
+    tools = wrap_tools_with_logging(tools)
+    return create_react_agent(model, tools, prompt=AGENT_SYSTEM_PROMPT)
 
 
-def run_agent_with_guardrails(agent, messages, config=None):
+def create_advisor_agent(vectorstore=None):
     """
-    Invoke the agent and apply response guardrails. Returns final response text
-    and trajectory (list of steps for debugging).
+    Advisor agent focused on reasoning, metrics, and simulation. It can still
+    use market tools when needed but is biased toward analysis.
+    """
+    if not GROQ_API_KEY:
+        raise ValueError("GROQ_API_KEY is not set. Add it to your .env file.")
+    model = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY, temperature=0.2)
+    tools = [
+        calculate_sharpe_ratio,
+        calculate_portfolio_metrics,
+        compound_annual_growth_rate,
+        run_portfolio_simulation,
+        # Allow advisor to still pull prices/info when required
+        get_stock_price,
+        get_stock_info,
+        get_historical_prices,
+        calculate_holding_value,
+        get_stock_news_sentiment,
+    ]
+    if vectorstore is not None:
+        tools.append(make_retrieve_portfolio_tool(vectorstore))
+    tools = wrap_tools_with_logging(tools)
+    return create_react_agent(model, tools, prompt=AGENT_SYSTEM_PROMPT)
+
+
+def create_supervisor_agents(vectorstore=None):
+    """Create a supervisor routing setup that chooses Research vs Advisor agent."""
+    research_agent = create_research_agent(vectorstore=vectorstore)
+    advisor_agent = create_advisor_agent(vectorstore=vectorstore)
+    return {"research": research_agent, "advisor": advisor_agent}
+
+
+def _supervisor_route(question: str) -> str:
+    """Heuristic supervisor that routes the query to Research or Advisor agent."""
+    q = (question or "").lower()
+    if any(w in q for w in ["simulate", "simulation", "projection", "monte carlo", "cagr", "sharpe", "volatility"]):
+        return "advisor"
+    if any(w in q for w in ["allocate", "rebalance", "risk", "portfolio metrics"]):
+        return "advisor"
+    # Default to research for data-centric queries (prices, info, news, portfolio lookups)
+    return "research"
+
+
+def run_agent_with_guardrails(agents: Dict[str, Any], messages: List[BaseMessage], config: Optional[Dict[str, Any]] = None):
+    """
+    Invoke the appropriate sub-agent via the supervisor and apply LLM-as-judge guardrails.
+    Returns final response text, trajectory, and raw messages.
     """
     config = config or {}
     config.setdefault("recursion_limit", AGENT_RECURSION_LIMIT)
+
+    question = ""
+    for m in messages:
+        if isinstance(m, HumanMessage):
+            question = m.content
+    route = _supervisor_route(question)
+    agent = agents.get(route) or agents.get("advisor")
+
+    t0 = time.time()
     result = agent.invoke({"messages": messages}, config=config)
-    out_messages = result.get("messages", [])
-    # Extract final assistant text (last AI message) and trajectory
-    response_text = ""
-    trajectory = []
-    for m in out_messages:
-        if hasattr(m, "tool_calls") and m.tool_calls:
-            for tc in m.tool_calls:
-                trajectory.append({"tool": tc.get("name"), "args": tc.get("args", {})})
-        if getattr(m, "__class__", {}).__name__ == "AIMessage" and getattr(m, "content", None):
-            response_text = m.content if isinstance(m.content, str) else str(m.content)
-    # Guardrails
-    passed, msg = check_response_guardrails(response_text)
-    if not passed:
-        response_text = (
-            "I can't provide that level of specificity for legal or tax matters. "
-            "Please consult a qualified professional." + get_disclaimer_fragment()
+    duration_ms = (time.time() - t0) * 1000.0
+    out_messages: List[BaseMessage] = result.get("messages", [])
+
+    response_text, trajectory, tools_used = _extract_final_text_and_trajectory(out_messages)
+    response_text = _normalize_text(response_text)
+
+    # LLM-as-judge guardrails
+    allowed, needs_disclaimer = _llm_guardrail_judge(question, response_text)
+    guardrail_triggered = False
+    if not allowed:
+        guardrail_triggered = True
+        log_guardrail_event(
+            "blocked",
+            {
+                "question": question,
+                "answer_preview": response_text[:500],
+                "route": route,
+            },
         )
-    elif msg and "Consider appending" in msg and get_disclaimer_fragment() not in response_text.lower():
+        response_text = (
+            "I can't provide that level of specificity for legal, tax, or investment decisions. "
+            "Please consult a qualified professional for personalized advice."
+            + get_disclaimer_fragment()
+        )
+    elif needs_disclaimer and get_disclaimer_fragment().lower().strip() not in response_text.lower():
+        guardrail_triggered = True
+        log_guardrail_event(
+            "disclaimer_appended",
+            {
+                "question": question,
+                "answer_preview": response_text[:500],
+                "route": route,
+            },
+        )
         response_text = response_text.rstrip() + get_disclaimer_fragment()
+
+    # Eval pipeline (uses RAG context when available; here we only know tools and messages)
+    retrieved_context = ""
+    for step in trajectory:
+        if step.get("tool") == "retrieve_portfolio":
+            # If the tool was called, the tool's text is already baked into the answer context.
+            # For now, we approximate factual grounding using the final answer only.
+            retrieved_context = "portfolio"
+            break
+    log_eval_result(
+        question=question,
+        answer=response_text,
+        tools_used=tools_used,
+        retrieved_context=retrieved_context,
+        guardrail_triggered=guardrail_triggered,
+    )
+
+    token_estimate = len(response_text.split())
+    log_response_metrics(
+        question=question,
+        answer=response_text,
+        tools_used=tools_used,
+        token_estimate=token_estimate,
+        duration_ms=duration_ms,
+    )
+
     return response_text, trajectory, out_messages
+

@@ -2,6 +2,31 @@
 """Market data tools using yfinance."""
 from langchain_core.tools import tool
 import yfinance as yf
+from .cache import ticker_price_cache, ticker_info_cache, historical_cache
+
+
+def _fetch_ticker_info(ticker: str):
+    """Internal helper with 60s TTL caching around yfinance.Ticker.info."""
+    cache_key = ticker.upper()
+    cached = ticker_info_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    stock = yf.Ticker(cache_key)
+    info = stock.info
+    ticker_info_cache.set(cache_key, info)
+    return info
+
+
+def _fetch_ticker_history(ticker: str, period: str = "1y"):
+    """Internal helper with 60s TTL caching around yfinance.Ticker.history."""
+    cache_key = f"{ticker.upper()}::{period}"
+    cached = historical_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    stock = yf.Ticker(ticker.upper())
+    hist = stock.history(period=period or "1y")
+    historical_cache.set(cache_key, hist)
+    return hist
 
 
 @tool
@@ -11,8 +36,7 @@ def get_stock_price(ticker: str) -> str:
     if not ticker:
         return "Please provide a valid stock ticker symbol."
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
+        info = _fetch_ticker_info(ticker)
         price = info.get("currentPrice") or info.get("regularMarketPrice") or "N/A"
         high_52 = info.get("fiftyTwoWeekHigh", "N/A")
         low_52 = info.get("fiftyTwoWeekLow", "N/A")
@@ -43,8 +67,7 @@ def get_stock_info(ticker: str) -> str:
     if not ticker:
         return "Please provide a valid stock ticker symbol."
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
+        info = _fetch_ticker_info(ticker)
         name = info.get("longName") or info.get("shortName", ticker)
         sector = info.get("sector", "N/A")
         industry = info.get("industry", "N/A")
@@ -68,8 +91,7 @@ def get_historical_prices(ticker: str, period: str = "1y") -> str:
     if not ticker:
         return "Please provide a valid stock ticker symbol."
     try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period=period or "1y")
+        hist = _fetch_ticker_history(ticker, period=period or "1y")
         if hist.empty or len(hist) < 2:
             return f"Insufficient history for {ticker} over {period}."
         start_price = float(hist["Close"].iloc[0])
@@ -96,10 +118,10 @@ def calculate_holding_value(ticker: str, shares: float) -> str:
     except (TypeError, ValueError):
         return "Shares must be a valid number."
     try:
-        stock = yf.Ticker(ticker)
-        price = stock.info.get("currentPrice") or stock.info.get("regularMarketPrice")
+        info = _fetch_ticker_info(ticker)
+        price = info.get("currentPrice") or info.get("regularMarketPrice")
         if price is None:
-            hist = stock.history(period="5d")
+            hist = _fetch_ticker_history(ticker, period="5d")
             price = float(hist["Close"].iloc[-1]) if not hist.empty else None
         if price is None:
             return f"Could not get current price for {ticker}."

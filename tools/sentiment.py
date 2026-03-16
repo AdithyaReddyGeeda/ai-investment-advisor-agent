@@ -2,6 +2,7 @@
 """News/sentiment tool: placeholder and optional API integration."""
 import os
 from langchain_core.tools import tool
+from .cache import ticker_info_cache
 
 
 @tool
@@ -24,8 +25,14 @@ def get_stock_news_sentiment(ticker: str) -> str:
                     f"&apikey={api_key}"
                     "&limit=5"
                 )
-                r = requests.get(url, timeout=10)
-                data = r.json()
+                cache_key = f"news::{ticker}"
+                cached = ticker_info_cache.get(cache_key)
+                if cached is None:
+                    r = requests.get(url, timeout=10)
+                    data = r.json()
+                    ticker_info_cache.set(cache_key, data)
+                else:
+                    data = cached
                 feed = data.get("feed", [])
                 if feed:
                     sentiments = [

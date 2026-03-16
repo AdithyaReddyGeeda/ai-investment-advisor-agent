@@ -13,7 +13,7 @@ PERSIST_DIR = os.getenv("PERSIST_DIR", str(DATA_DIR / "chroma"))
 CONVERSATION_DB = os.getenv("CONVERSATION_DB", str(DATA_DIR / "conversations.db"))
 
 # LLM
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 # Embeddings & RAG
