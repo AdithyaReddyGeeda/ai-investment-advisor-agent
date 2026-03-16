@@ -1,5 +1,6 @@
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -28,7 +29,12 @@ def get_agent_logger() -> logging.Logger:
     if logger.handlers:
         return logger
     logger.setLevel(logging.INFO)
-    handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=5_000_000,
+        backupCount=5,
+        encoding="utf-8",
+    )
 
     class JsonFormatter(logging.Formatter):
         def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]

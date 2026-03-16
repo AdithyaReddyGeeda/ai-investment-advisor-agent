@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Portfolio scenario simulation (Monte Carlo–style projection)."""
-import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import yfinance as yf
 from langchain_core.tools import tool
@@ -27,14 +27,20 @@ def _fetch_historical_returns(ticker: str, years: int = 5) -> np.ndarray | None:
         return None
 
 
-async def _fetch_all_returns_concurrent(tickers: list[str], years: int) -> list[np.ndarray | None]:
-    loop = asyncio.get_running_loop()
-
-    async def _one(t: str):
-        return await loop.run_in_executor(None, _fetch_historical_returns, t, years + 1)
-
-    tasks = [_one(t) for t in tickers]
-    return await asyncio.gather(*tasks)
+def _fetch_all_returns_concurrent(tickers: list[str], years: int) -> list[np.ndarray | None]:
+    """Fetch historical returns for each ticker in parallel using threads."""
+    results: dict[str, np.ndarray | None] = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_ticker = {
+            executor.submit(_fetch_historical_returns, t, years + 1): t for t in tickers
+        }
+        for fut in as_completed(future_to_ticker):
+            t = future_to_ticker[fut]
+            try:
+                results[t] = fut.result()
+            except Exception:
+                results[t] = None
+    return [results.get(t) for t in tickers]
 
 
 @tool
@@ -75,11 +81,7 @@ def run_portfolio_simulation(
     weights = np.array(weights)
 
     # Get historical returns per ticker concurrently to speed up multi-ticker sims
-    try:
-        returns_list = asyncio.run(_fetch_all_returns_concurrent(tickers, years=years))
-    except RuntimeError:
-        # If there's already a running loop (e.g. inside another async context), fall back to sequential
-        returns_list = [_fetch_historical_returns(t, years=years + 1) for t in tickers]
+    returns_list = _fetch_all_returns_concurrent(tickers, years=years)
     for t, r in zip(tickers, returns_list):
         if r is None or len(r) < 22:
             return f"Insufficient history for {t}. Use major tickers (e.g. AAPL, MSFT)."

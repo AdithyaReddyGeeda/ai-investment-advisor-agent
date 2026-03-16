@@ -13,9 +13,10 @@ def wrap_tools_with_logging(tools: List[BaseTool]) -> List[BaseTool]:
 
     for t in tools:
         name = getattr(t, "name", t.__class__.__name__)
+        description = getattr(t, "description", "") or f"Logged wrapper around tool {name}."
 
-        @tool_factory
-        def logged_tool(**kwargs: Any) -> Any:  # type: ignore[no-redef]
+        def logged_tool_func(**kwargs: Any) -> Any:
+            """Logged wrapper around an underlying LangChain tool."""
             start = time.time()
             try:
                 result = t.invoke(kwargs)
@@ -38,8 +39,10 @@ def wrap_tools_with_logging(tools: List[BaseTool]) -> List[BaseTool]:
                 )
                 raise
 
+        # Create LangChain tool from the function; docstring + attributes satisfy validation.
+        logged_tool = tool_factory(logged_tool_func)
         logged_tool.name = name  # type: ignore[attr-defined]
-        logged_tool.description = getattr(t, "description", "")  # type: ignore[attr-defined]
+        logged_tool.description = description  # type: ignore[attr-defined]
         wrapped.append(logged_tool)  # type: ignore[arg-type]
 
     return wrapped

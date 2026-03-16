@@ -1,4 +1,5 @@
 import time
+from threading import Lock
 from typing import Any, Dict, Tuple
 
 
@@ -12,23 +13,26 @@ class TTLCache:
     def __init__(self, ttl_seconds: int = 60):
         self.ttl = ttl_seconds
         self._store: Dict[str, Tuple[float, Any]] = {}
+        self._lock = Lock()
 
     def _now(self) -> float:
         return time.time()
 
     def get(self, key: str) -> Any:
-        item = self._store.get(key)
-        if not item:
-            return None
-        ts, value = item
-        if self._now() - ts > self.ttl:
-            # Expired
-            self._store.pop(key, None)
-            return None
-        return value
+        with self._lock:
+            item = self._store.get(key)
+            if not item:
+                return None
+            ts, value = item
+            if self._now() - ts > self.ttl:
+                # Expired
+                self._store.pop(key, None)
+                return None
+            return value
 
     def set(self, key: str, value: Any) -> None:
-        self._store[key] = (self._now(), value)
+        with self._lock:
+            self._store[key] = (self._now(), value)
 
 
 # Shared caches for ticker-centric data

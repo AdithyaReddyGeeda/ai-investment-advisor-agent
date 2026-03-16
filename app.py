@@ -17,12 +17,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from config import REQUIRED_CSV_COLUMNS, DATA_DIR, PERSIST_DIR
+from guardrails.compliance import check_portfolio_concentration
 from rag.store import build_portfolio_docs, get_or_create_vectorstore
+from rag.memory import cleanup_old_sessions
 from agent.graph import create_supervisor_agents, run_agent_with_guardrails
 
-# Ensure data dir exists
+# Ensure data dir exists and cleanup old memory collections once at startup
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 Path(PERSIST_DIR).mkdir(parents=True, exist_ok=True)
+cleanup_old_sessions()
 
 def validate_portfolio_csv(df: pd.DataFrame) -> tuple[bool, str]:
     """Check that DataFrame has required columns. Returns (ok, error_message)."""
@@ -82,6 +85,11 @@ with st.sidebar:
                 total_cost = (df["shares"].astype(float) * df["purchase_price"].astype(float)).sum()
                 st.metric("Positions", len(df))
                 st.metric("Total cost basis", f"${total_cost:,.2f}")
+                # Concentration warnings
+                weights = (df["shares"].astype(float) * df["purchase_price"].astype(float)) / total_cost if total_cost > 0 else []
+                flags = check_portfolio_concentration(weights.tolist() if hasattr(weights, "tolist") else list(weights))
+                if flags:
+                    st.warning("Portfolio concentration risk:\n" + "\n".join(flags))
                 portfolio_df = df
                 docs = build_portfolio_docs(df)
                 st.session_state.vectorstore = get_or_create_vectorstore(

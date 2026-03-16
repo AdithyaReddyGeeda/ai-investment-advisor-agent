@@ -89,17 +89,6 @@ def _normalize_text(text: str) -> str:
         return ""
     text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
     text = " ".join(text.split())
-    text = re.sub(r"\.([a-zA-Z])", r". \1", text)
-    text = re.sub(r"(\d|[.,])([a-zA-Z])", r"\1 \2", text)
-    text = re.sub(r"([a-zA-Z])(\d)", r"\1 \2", text)
-    text = re.sub(r"purchasepricepershareis", "purchase price per share is", text, flags=re.IGNORECASE)
-    text = re.sub(r"pricepershare", "price per share", text, flags=re.IGNORECASE)
-    text = re.sub(r"thepurchase", "the purchase", text, flags=re.IGNORECASE)
-    text = re.sub(r"priceof", "price of", text, flags=re.IGNORECASE)
-    text = re.sub(r"purchaseprice", "purchase price", text, flags=re.IGNORECASE)
-    text = re.sub(r"pershare", "per share", text, flags=re.IGNORECASE)
-    text = re.sub(r"shareis", "share is", text, flags=re.IGNORECASE)
-    text = re.sub(r"andpurchase", "and a purchase", text, flags=re.IGNORECASE)
     return " ".join(text.split())
 
 
@@ -196,13 +185,31 @@ def create_supervisor_agents(vectorstore=None):
 
 
 def _supervisor_route(question: str) -> str:
-    """Heuristic supervisor that routes the query to Research or Advisor agent."""
-    q = (question or "").lower()
-    if any(w in q for w in ["simulate", "simulation", "projection", "monte carlo", "cagr", "sharpe", "volatility"]):
-        return "advisor"
-    if any(w in q for w in ["allocate", "rebalance", "risk", "portfolio metrics"]):
-        return "advisor"
-    # Default to research for data-centric queries (prices, info, news, portfolio lookups)
+    """LLM-based router that classifies the question as research vs advisor."""
+    q = (question or "").strip()
+    if not q or not GROQ_API_KEY:
+        return "research"
+    router_model = ChatGroq(
+        model=GROQ_MODEL,
+        api_key=GROQ_API_KEY,
+        temperature=0.0,
+    )
+    prompt = (
+        "You are a router. Given this user question, respond with exactly one word: "
+        "'research' if the question is about fetching market data, news, prices, or portfolio holdings, "
+        "or 'advisor' if it is about analysis, metrics, Sharpe ratio, simulations, or recommendations.\n"
+        f"Question: {q}"
+    )
+    try:
+        resp = router_model.invoke([HumanMessage(content=prompt)])
+        content = resp.content if isinstance(resp.content, str) else str(resp.content)
+        word = content.strip().lower()
+        if "advisor" in word:
+            return "advisor"
+        if "research" in word:
+            return "research"
+    except Exception:
+        pass
     return "research"
 
 
@@ -247,7 +254,7 @@ def run_agent_with_guardrails(agents: Dict[str, Any], messages: List[BaseMessage
             "Please consult a qualified professional for personalized advice."
             + get_disclaimer_fragment()
         )
-    elif needs_disclaimer and get_disclaimer_fragment().lower().strip() not in response_text.lower():
+    elif needs_disclaimer:
         guardrail_triggered = True
         log_guardrail_event(
             "disclaimer_appended",
@@ -257,7 +264,6 @@ def run_agent_with_guardrails(agents: Dict[str, Any], messages: List[BaseMessage
                 "route": route,
             },
         )
-        response_text = response_text.rstrip() + get_disclaimer_fragment()
 
     # Eval pipeline (uses RAG context when available; here we only know tools and messages)
     retrieved_context = ""
@@ -283,6 +289,10 @@ def run_agent_with_guardrails(agents: Dict[str, Any], messages: List[BaseMessage
         token_estimate=token_estimate,
         duration_ms=duration_ms,
     )
+
+    # Universal disclaimer for substantive responses
+    if len(response_text) > 100 and get_disclaimer_fragment().strip() not in response_text:
+        response_text = response_text.rstrip() + get_disclaimer_fragment()
 
     return response_text, trajectory, out_messages
 
